@@ -2,20 +2,25 @@
 OneNote MCP Server (Local Files)
 =================================
 An MCP (Model Context Protocol) server that reads local OneNote (.one) files
-directly from disk. No Azure registration or authentication needed.
+directly from disk and writes to OneNote via the COM API.
+No Azure registration or authentication needed.
 
-This parses the OneNote backup files stored at:
+Reading: parses backup files at:
     C:\\Users\\<user>\\AppData\\Local\\Microsoft\\OneNote\\16.0\\Backup\\
+
+Writing: uses the OneNote COM API via PowerShell (requires OneNote desktop app).
 
 It exposes tools for Claude Code to:
     - List all notebooks and sections
-    - List pages in a section
     - Read page text content
     - Search across all pages
+    - Create new pages in any notebook/section
+    - Append content to existing pages
 
 Prerequisites:
     pip install "mcp[cli]" pyOneNote
     (or: uv add "mcp[cli]" pyOneNote)
+    + OneNote desktop app (for write features)
 
 Usage with Claude Code:
     claude mcp add --transport stdio onenote -- uv --directory "path/to/this/project" run server.py
@@ -24,7 +29,10 @@ Usage with Claude Code:
 import logging
 import os
 import re
+import subprocess
 import sys
+import tempfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from pyOneNote.OneDocument import OneDocment
@@ -376,6 +384,270 @@ async def get_notebook_summary(notebook_name: str) -> str:
         lines.append("")
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# OneNote COM API helpers (for writing)
+# ---------------------------------------------------------------------------
+
+ONE_NS = "http://schemas.microsoft.com/office/onenote/2013/onenote"
+
+
+def _run_powershell(script: str) -> tuple[bool, str]:
+    """Run a PowerShell script and return (success, output)."""
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-Command", script],
+            capture_output=True, text=True, timeout=30,
+        )
+        output = result.stdout.strip()
+        if result.returncode != 0:
+            return False, result.stderr.strip() or output
+        return True, output
+    except subprocess.TimeoutExpired:
+        return False, "PowerShell command timed out"
+    except FileNotFoundError:
+        return False, "PowerShell not found (write features require Windows)"
+
+
+def _com_get_hierarchy(level: int = 3) -> ET.Element | None:
+    """
+    Get OneNote hierarchy via COM API.
+    Levels: 0=Notebooks, 1=SectionGroups, 2=Sections, 3=Sections(full), 4=Pages
+    """
+    tmpfile = os.path.join(tempfile.gettempdir(), "onenote_hierarchy.xml")
+    # Escape backslashes for PowerShell string
+    tmpfile_ps = tmpfile.replace("\\", "\\\\")
+    script = (
+        f'$onenote = New-Object -ComObject OneNote.Application; '
+        f'$h = ""; '
+        f'$onenote.GetHierarchy("", {level}, [ref]$h); '
+        f'$h | Out-File -FilePath "{tmpfile_ps}" -Encoding UTF8; '
+        f'Write-Output "OK"'
+    )
+    ok, msg = _run_powershell(script)
+    if not ok:
+        log.warning("COM GetHierarchy failed: %s", msg)
+        return None
+    try:
+        with open(tmpfile, "r", encoding="utf-8-sig") as f:
+            xml_content = f.read()
+        return ET.fromstring(xml_content)
+    except Exception as e:
+        log.warning("Failed to parse hierarchy XML: %s", e)
+        return None
+    finally:
+        try:
+            os.remove(tmpfile)
+        except OSError:
+            pass
+
+
+def _com_find_section_id(notebook_name: str, section_name: str) -> str | None:
+    """Find a section ID by notebook and section name (case-insensitive)."""
+    root = _com_get_hierarchy(3)
+    if root is None:
+        return None
+
+    for nb in root.iter(f"{{{ONE_NS}}}Notebook"):
+        if nb.get("name", "").lower() != notebook_name.lower():
+            continue
+        for sec in nb.iter(f"{{{ONE_NS}}}Section"):
+            if sec.get("isInRecycleBin") == "true":
+                continue
+            if sec.get("name", "").lower() == section_name.lower():
+                return sec.get("ID")
+    return None
+
+
+def _com_create_page(section_id: str, title: str, body_html: str) -> tuple[bool, str]:
+    """Create a new page in a section using the OneNote COM API."""
+    # Escape special characters for PowerShell
+    section_id_esc = section_id.replace("'", "''")
+    title_esc = title.replace("'", "''").replace('"', '&quot;')
+    body_esc = body_html.replace("'", "''").replace('"', '&quot;')
+
+    script = (
+        f"$onenote = New-Object -ComObject OneNote.Application; "
+        f"$pageId = ''; "
+        f"$onenote.CreateNewPage('{section_id_esc}', [ref]$pageId, 0); "
+        f"$pageXml = ''; "
+        f"$onenote.GetPageContent($pageId, [ref]$pageXml, 0); "
+        f"$ns = @{{one='http://schemas.microsoft.com/office/onenote/2013/onenote'}}; "
+        f"$xml = [xml]$pageXml; "
+        f"$titleNode = $xml.SelectSingleNode('//one:Title/one:OE/one:T', "
+        f"  (New-Object System.Xml.XmlNamespaceManager($xml.NameTable)).PSBase); "
+        f"$nsMgr = New-Object System.Xml.XmlNamespaceManager($xml.NameTable); "
+        f"$nsMgr.AddNamespace('one', 'http://schemas.microsoft.com/office/onenote/2013/onenote'); "
+        f"$titleNode2 = $xml.SelectSingleNode('//one:Title/one:OE/one:T', $nsMgr); "
+        f"if ($titleNode2) {{ $titleNode2.InnerText = '{title_esc}' }}; "
+        f"$outline = $xml.CreateElement('one', 'Outline', 'http://schemas.microsoft.com/office/onenote/2013/onenote'); "
+        f"$oe = $xml.CreateElement('one', 'OEChildren', 'http://schemas.microsoft.com/office/onenote/2013/onenote'); "
+        f"$oe1 = $xml.CreateElement('one', 'OE', 'http://schemas.microsoft.com/office/onenote/2013/onenote'); "
+        f"$t = $xml.CreateElement('one', 'T', 'http://schemas.microsoft.com/office/onenote/2013/onenote'); "
+        f"$cdata = $xml.CreateCDataSection('{body_esc}'); "
+        f"$t.AppendChild($cdata) | Out-Null; "
+        f"$oe1.AppendChild($t) | Out-Null; "
+        f"$oe.AppendChild($oe1) | Out-Null; "
+        f"$outline.AppendChild($oe) | Out-Null; "
+        f"$xml.DocumentElement.AppendChild($outline) | Out-Null; "
+        f"$onenote.UpdatePageContent($xml.OuterXml, [DateTime]::MinValue, 0); "
+        f"Write-Output $pageId"
+    )
+    ok, output = _run_powershell(script)
+    if ok and output:
+        return True, f"Page '{title}' created successfully (ID: {output})"
+    return False, f"Failed to create page: {output}"
+
+
+def _com_append_to_page(page_id: str, body_html: str) -> tuple[bool, str]:
+    """Append content to an existing page using the OneNote COM API."""
+    page_id_esc = page_id.replace("'", "''")
+    body_esc = body_html.replace("'", "''").replace('"', '&quot;')
+
+    script = (
+        f"$onenote = New-Object -ComObject OneNote.Application; "
+        f"$pageXml = ''; "
+        f"$onenote.GetPageContent('{page_id_esc}', [ref]$pageXml, 0); "
+        f"$xml = [xml]$pageXml; "
+        f"$outline = $xml.CreateElement('one', 'Outline', 'http://schemas.microsoft.com/office/onenote/2013/onenote'); "
+        f"$oe = $xml.CreateElement('one', 'OEChildren', 'http://schemas.microsoft.com/office/onenote/2013/onenote'); "
+        f"$oe1 = $xml.CreateElement('one', 'OE', 'http://schemas.microsoft.com/office/onenote/2013/onenote'); "
+        f"$t = $xml.CreateElement('one', 'T', 'http://schemas.microsoft.com/office/onenote/2013/onenote'); "
+        f"$cdata = $xml.CreateCDataSection('{body_esc}'); "
+        f"$t.AppendChild($cdata) | Out-Null; "
+        f"$oe1.AppendChild($t) | Out-Null; "
+        f"$oe.AppendChild($oe1) | Out-Null; "
+        f"$outline.AppendChild($oe) | Out-Null; "
+        f"$xml.DocumentElement.AppendChild($outline) | Out-Null; "
+        f"$onenote.UpdatePageContent($xml.OuterXml, [DateTime]::MinValue, 0); "
+        f"Write-Output 'OK'"
+    )
+    ok, output = _run_powershell(script)
+    if ok:
+        return True, "Content appended successfully."
+    return False, f"Failed to append content: {output}"
+
+
+def _com_list_pages(section_id: str) -> list[dict]:
+    """List pages in a section via COM API. Returns list of {id, name}."""
+    root = _com_get_hierarchy(4)
+    if root is None:
+        return []
+
+    pages = []
+    for sec in root.iter(f"{{{ONE_NS}}}Section"):
+        if sec.get("ID") == section_id:
+            for page in sec.iter(f"{{{ONE_NS}}}Page"):
+                if page.get("isInRecycleBin") == "true":
+                    continue
+                pages.append({
+                    "id": page.get("ID", ""),
+                    "name": page.get("name", "(untitled)"),
+                })
+            break
+    return pages
+
+
+# ---------------------------------------------------------------------------
+# MCP Write Tools
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def list_live_notebooks() -> str:
+    """List notebooks from the running OneNote app (live, not backup files).
+
+    This uses the OneNote COM API and shows the notebooks currently open in
+    the OneNote desktop app, including their sections. Use this to find
+    where to create new pages.
+    """
+    root = _com_get_hierarchy(3)
+    if root is None:
+        return "Could not connect to OneNote. Make sure the OneNote desktop app is installed."
+
+    lines = []
+    for nb in root.findall(f"{{{ONE_NS}}}Notebook"):
+        nb_name = nb.get("name", "?")
+        lines.append(f"\n## {nb_name}")
+        for sec in nb.iter(f"{{{ONE_NS}}}Section"):
+            if sec.get("isInRecycleBin") == "true":
+                continue
+            sec_name = sec.get("name", "?")
+            locked = " (locked)" if sec.get("locked") == "true" else ""
+            lines.append(f"  - {sec_name}{locked}")
+
+    if not lines:
+        return "No notebooks found in OneNote."
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def create_page(notebook_name: str, section_name: str, title: str, content: str) -> str:
+    """Create a new page in a OneNote notebook section.
+
+    The content is written as HTML. You can use basic HTML tags like
+    <b>, <i>, <br>, <ul>, <li>, <h1>-<h6>, etc.
+
+    Requires the OneNote desktop app to be installed.
+
+    Args:
+        notebook_name: Name of the notebook (from list_live_notebooks).
+        section_name: Name of the section within the notebook.
+        title: Title for the new page.
+        content: The page content (plain text or HTML).
+    """
+    section_id = _com_find_section_id(notebook_name, section_name)
+    if section_id is None:
+        return (
+            f"Could not find section '{section_name}' in notebook '{notebook_name}'. "
+            f"Use list_live_notebooks to see available notebooks and sections."
+        )
+
+    ok, msg = _com_create_page(section_id, title, content)
+    return msg
+
+
+@mcp.tool()
+async def list_live_pages(notebook_name: str, section_name: str) -> str:
+    """List pages in a section from the running OneNote app.
+
+    Use this to find page IDs for appending content to existing pages.
+
+    Args:
+        notebook_name: Name of the notebook.
+        section_name: Name of the section.
+    """
+    section_id = _com_find_section_id(notebook_name, section_name)
+    if section_id is None:
+        return (
+            f"Could not find section '{section_name}' in notebook '{notebook_name}'. "
+            f"Use list_live_notebooks to see available notebooks and sections."
+        )
+
+    pages = _com_list_pages(section_id)
+    if not pages:
+        return "No pages found in this section."
+
+    lines = []
+    for p in pages:
+        lines.append(f"- {p['name']}  (id: {p['id']})")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def append_to_page(page_id: str, content: str) -> str:
+    """Append content to an existing OneNote page.
+
+    The content is added as a new outline block at the bottom of the page.
+    Supports HTML formatting (<b>, <i>, <br>, <ul>, <li>, etc.).
+
+    Args:
+        page_id: The page ID (from list_live_pages).
+        content: The content to append (plain text or HTML).
+    """
+    ok, msg = _com_append_to_page(page_id, content)
+    return msg
 
 
 # ---------------------------------------------------------------------------
