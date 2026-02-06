@@ -393,6 +393,41 @@ async def get_notebook_summary(notebook_name: str) -> str:
 ONE_NS = "http://schemas.microsoft.com/office/onenote/2013/onenote"
 
 
+def _sanitize_html_for_onenote(html: str) -> str:
+    """
+    Convert HTML to OneNote-compatible inline HTML.
+
+    OneNote's <one:T> element only supports inline HTML (b, i, span, br, etc.).
+    Block-level elements (h1-h6, p, ul, ol, li, div, table, etc.) cause
+    UpdatePageContent to silently fail.
+
+    Also escapes ]]> which would break the CDATA wrapper.
+    """
+    # Escape ]]> so it doesn't break CDATA sections
+    html = html.replace("]]>", "]]&gt;")
+
+    # Convert block-level closing tags to <br/>
+    html = re.sub(r"</(?:p|div|h[1-6]|li|tr|blockquote)>", "<br/>", html, flags=re.IGNORECASE)
+
+    # Remove block-level opening tags (keep their content)
+    html = re.sub(r"<(?:p|div|h[1-6]|li|tr|td|th|blockquote|ul|ol|table|thead|tbody)(?:\s[^>]*)?>", "", html, flags=re.IGNORECASE)
+
+    # Remove remaining closing tags for container elements
+    html = re.sub(r"</(?:ul|ol|table|thead|tbody|td|th)>", "", html, flags=re.IGNORECASE)
+
+    # Clean up multiple consecutive <br/> tags
+    html = re.sub(r"(<br\s*/?>){3,}", "<br/><br/>", html, flags=re.IGNORECASE)
+
+    # Normalize br tags
+    html = re.sub(r"<br\s*/?>", "<br/>", html, flags=re.IGNORECASE)
+
+    # Strip leading/trailing <br/>
+    html = re.sub(r"^(<br/>)+", "", html)
+    html = re.sub(r"(<br/>)+$", "", html)
+
+    return html.strip()
+
+
 def _run_powershell(script: str) -> tuple[bool, str]:
     """Run a PowerShell script and return (success, output)."""
     try:
@@ -487,6 +522,8 @@ def _run_powershell_file(script: str) -> tuple[bool, str]:
 
 def _com_create_page(section_id: str, title: str, body_html: str) -> tuple[bool, str]:
     """Create a new page in a section using the OneNote COM API."""
+    # Sanitize HTML to OneNote-compatible inline format
+    body_html = _sanitize_html_for_onenote(body_html)
     # Escape for PowerShell string literals (double up single quotes)
     section_id_esc = section_id.replace("'", "''")
     title_esc = title.replace("'", "''")
@@ -541,6 +578,7 @@ Write-Output $pageId
 
 def _com_append_to_page(page_id: str, body_html: str) -> tuple[bool, str]:
     """Append content to an existing page using the OneNote COM API."""
+    body_html = _sanitize_html_for_onenote(body_html)
     page_id_esc = page_id.replace("'", "''")
     body_esc = body_html.replace("'", "''")
 
