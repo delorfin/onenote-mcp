@@ -413,10 +413,10 @@ def _sanitize_html_for_onenote(html: str) -> str:
     html = html.replace("]]>", "]]&gt;")
 
     # Convert block-level closing tags to <br/>
-    html = re.sub(r"</(?:p|div|h[1-6]|li|tr|blockquote)>", "<br/>", html, flags=re.IGNORECASE)
+    html = re.sub(r"</(?:p|div|h[1-6]|li|tr|blockquote|pre|code|section|article|header|footer|nav|aside|details|summary|figure|figcaption|dl|dt|dd)>", "<br/>", html, flags=re.IGNORECASE)
 
     # Remove block-level opening tags (keep their content)
-    html = re.sub(r"<(?:p|div|h[1-6]|li|tr|td|th|blockquote|ul|ol|table|thead|tbody)(?:\s[^>]*)?>", "", html, flags=re.IGNORECASE)
+    html = re.sub(r"<(?:p|div|h[1-6]|li|tr|td|th|blockquote|ul|ol|table|thead|tbody|pre|code|section|article|header|footer|nav|aside|details|summary|figure|figcaption|dl|dt|dd)(?:\s[^>]*)?>", "", html, flags=re.IGNORECASE)
 
     # Remove remaining closing tags for container elements
     html = re.sub(r"</(?:ul|ol|table|thead|tbody|td|th)>", "", html, flags=re.IGNORECASE)
@@ -540,12 +540,23 @@ def _com_create_page(section_id: str, title: str, body_html: str) -> tuple[bool,
     # Sanitize HTML to OneNote-compatible inline format
     body_html = _sanitize_html_for_onenote(body_html)
     log.debug("create_page: sanitized body=%r", body_html[:500])
-    # Escape for PowerShell string literals (double up single quotes)
-    section_id_esc = section_id.replace("'", "''")
-    title_esc = title.replace("'", "''")
-    body_esc = body_html.replace("'", "''")
 
-    script = f'''
+    # Write title and body to temp files to avoid all escaping issues
+    title_file = os.path.join(tempfile.gettempdir(), "onenote_mcp_title.txt")
+    body_file = os.path.join(tempfile.gettempdir(), "onenote_mcp_body.txt")
+    with open(title_file, "w", encoding="utf-8") as f:
+        f.write(title)
+    with open(body_file, "w", encoding="utf-8") as f:
+        f.write(body_html)
+
+    section_id_esc = section_id.replace("'", "''")
+
+    script = f"""
+$titleContent = Get-Content -Path '{title_file.replace(chr(39), chr(39)+chr(39))}' -Raw -Encoding UTF8
+$bodyContent = Get-Content -Path '{body_file.replace(chr(39), chr(39)+chr(39))}' -Raw -Encoding UTF8
+if ($titleContent) {{ $titleContent = $titleContent.Trim() }}
+if ($bodyContent) {{ $bodyContent = $bodyContent.Trim() }}
+
 $onenote = New-Object -ComObject OneNote.Application
 $pageId = ""
 $onenote.CreateNewPage('{section_id_esc}', [ref]$pageId, 0)
@@ -560,10 +571,9 @@ $nsMgr = New-Object System.Xml.XmlNamespaceManager($xml.NameTable)
 $nsMgr.AddNamespace("one", "http://schemas.microsoft.com/office/onenote/2013/onenote")
 $titleNode = $xml.SelectSingleNode("//one:Title/one:OE/one:T", $nsMgr)
 if ($titleNode) {{
-    $titleNode.InnerXml = "<![CDATA[{title_esc}]]>"
+    $titleNode.InnerXml = "<![CDATA[" + $titleContent + "]]>"
 }}
 
-# Update title
 try {{
     $onenote.UpdatePageContent($xml.OuterXml)
 }} catch {{
@@ -581,7 +591,7 @@ $outline = $xml2.CreateElement("one", "Outline", "http://schemas.microsoft.com/o
 $oeChildren = $xml2.CreateElement("one", "OEChildren", "http://schemas.microsoft.com/office/onenote/2013/onenote")
 $oe = $xml2.CreateElement("one", "OE", "http://schemas.microsoft.com/office/onenote/2013/onenote")
 $t = $xml2.CreateElement("one", "T", "http://schemas.microsoft.com/office/onenote/2013/onenote")
-$cdata = $xml2.CreateCDataSection('{body_esc}')
+$cdata = $xml2.CreateCDataSection($bodyContent)
 $t.AppendChild($cdata) | Out-Null
 $oe.AppendChild($t) | Out-Null
 $oeChildren.AppendChild($oe) | Out-Null
@@ -595,12 +605,19 @@ try {{
     exit 1
 }}
 Write-Output $pageId
-'''
-    ok, output = _run_powershell_file(script)
-    log.info("create_page result: ok=%s output=%r", ok, output[:200] if output else "(empty)")
-    if ok and output:
-        return True, f"Page '{title}' created successfully (ID: {output})"
-    return False, f"Failed to create page: {output}"
+"""
+    try:
+        ok, output = _run_powershell_file(script)
+        log.info("create_page result: ok=%s output=%r", ok, output[:200] if output else "(empty)")
+        if ok and output:
+            return True, f"Page '{title}' created successfully (ID: {output})"
+        return False, f"Failed to create page: {output}"
+    finally:
+        for f in (title_file, body_file):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
 
 
 def _com_append_to_page(page_id: str, body_html: str) -> tuple[bool, str]:
@@ -609,10 +626,18 @@ def _com_append_to_page(page_id: str, body_html: str) -> tuple[bool, str]:
     log.debug("append_to_page: raw body=%r", body_html[:500])
     body_html = _sanitize_html_for_onenote(body_html)
     log.debug("append_to_page: sanitized body=%r", body_html[:500])
-    page_id_esc = page_id.replace("'", "''")
-    body_esc = body_html.replace("'", "''")
 
-    script = f'''
+    # Write body to temp file to avoid escaping issues
+    body_file = os.path.join(tempfile.gettempdir(), "onenote_mcp_body.txt")
+    with open(body_file, "w", encoding="utf-8") as f:
+        f.write(body_html)
+
+    page_id_esc = page_id.replace("'", "''")
+
+    script = f"""
+$bodyContent = Get-Content -Path '{body_file.replace(chr(39), chr(39)+chr(39))}' -Raw -Encoding UTF8
+if ($bodyContent) {{ $bodyContent = $bodyContent.Trim() }}
+
 $onenote = New-Object -ComObject OneNote.Application
 $pageXml = ""
 $onenote.GetPageContent('{page_id_esc}', [ref]$pageXml, 0)
@@ -622,7 +647,7 @@ $outline = $xml.CreateElement("one", "Outline", "http://schemas.microsoft.com/of
 $oeChildren = $xml.CreateElement("one", "OEChildren", "http://schemas.microsoft.com/office/onenote/2013/onenote")
 $oe = $xml.CreateElement("one", "OE", "http://schemas.microsoft.com/office/onenote/2013/onenote")
 $t = $xml.CreateElement("one", "T", "http://schemas.microsoft.com/office/onenote/2013/onenote")
-$cdata = $xml.CreateCDataSection('{body_esc}')
+$cdata = $xml.CreateCDataSection($bodyContent)
 $t.AppendChild($cdata) | Out-Null
 $oe.AppendChild($t) | Out-Null
 $oeChildren.AppendChild($oe) | Out-Null
@@ -636,12 +661,18 @@ try {{
     exit 1
 }}
 Write-Output "OK"
-'''
-    ok, output = _run_powershell_file(script)
-    log.info("append_to_page result: ok=%s output=%r", ok, output[:200] if output else "(empty)")
-    if ok:
-        return True, "Content appended successfully."
-    return False, f"Failed to append content: {output}"
+"""
+    try:
+        ok, output = _run_powershell_file(script)
+        log.info("append_to_page result: ok=%s output=%r", ok, output[:200] if output else "(empty)")
+        if ok:
+            return True, "Content appended successfully."
+        return False, f"Failed to append content: {output}"
+    finally:
+        try:
+            os.remove(body_file)
+        except OSError:
+            pass
 
 
 def _com_list_pages(section_id: str) -> list[dict]:
