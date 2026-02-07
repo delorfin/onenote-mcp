@@ -3,12 +3,20 @@ macOS Vision OCR for OneNote embedded images.
 
 Uses pyobjc (Vision + Quartz frameworks) to perform text recognition.
 Falls back gracefully on non-macOS platforms.
+
+OCR results are cached on disk keyed by SHA-256 of image bytes to avoid
+redundant recognition across backup rescans.
 """
 
+import hashlib
+import json
 import logging
 import sys
+from pathlib import Path
 
 log = logging.getLogger("onenote-mcp")
+
+OCR_CACHE_DIR = Path.home() / ".cache" / "onenote-mcp" / "ocr"
 
 _VISION_AVAILABLE = False
 
@@ -25,11 +33,45 @@ if sys.platform == "darwin":
         )
 
 
+def _cache_key(image_bytes: bytes) -> str:
+    return hashlib.sha256(image_bytes).hexdigest()
+
+
+def _load_cached(key: str) -> str | None:
+    cache_file = OCR_CACHE_DIR / f"{key}.json"
+    if cache_file.exists():
+        try:
+            data = json.loads(cache_file.read_text(encoding="utf-8"))
+            return data.get("text", "")
+        except Exception:
+            return None
+    return None
+
+
+def _save_cache(key: str, text: str) -> None:
+    try:
+        OCR_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        cache_file = OCR_CACHE_DIR / f"{key}.json"
+        cache_file.write_text(
+            json.dumps({"text": text}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        log.debug("OCR cache write failed: %s", e)
+
+
 def ocr_image(image_bytes: bytes) -> str:
     """Run macOS Vision OCR on image bytes, return recognized text.
 
     Returns empty string if OCR is unavailable or no text is found.
+    Results are cached on disk keyed by SHA-256 of the image bytes.
     """
+    key = _cache_key(image_bytes)
+    cached = _load_cached(key)
+    if cached is not None:
+        log.debug("OCR cache hit: %s", key[:12])
+        return cached
+
     if not _VISION_AVAILABLE:
         return ""
 
@@ -68,7 +110,9 @@ def ocr_image(image_bytes: bytes) -> str:
             if candidate:
                 lines.append(candidate[0].string())
 
-        return "\n".join(lines)
+        text = "\n".join(lines)
+        _save_cache(key, text)
+        return text
 
     except Exception as e:
         log.warning("OCR failed: %s", e)

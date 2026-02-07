@@ -3,9 +3,12 @@ Semantic search index for OneNote pages using sentence-transformers.
 
 Builds page-level embeddings and supports cosine similarity search.
 Index is persisted to ~/.cache/onenote-mcp/ and incrementally updated
-based on file modification times.
+based on file modification times. When a backup file is replaced by a
+newer snapshot, pages are matched by content hash so only truly changed
+pages need re-embedding.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -31,9 +34,22 @@ class EmbeddingIndex:
             self._model = SentenceTransformer(MODEL_NAME)
         return self._model
 
+    @staticmethod
+    def _content_hash(page_title: str, full_text: str) -> str:
+        """SHA-256 of page content for dedup across backup file renames."""
+        return hashlib.sha256(
+            (page_title + "\n" + full_text).encode("utf-8")
+        ).hexdigest()
+
     def build(self, notebooks: dict, parse_pages_fn) -> int:
         """
         Build or incrementally update the index from discovered notebooks.
+
+        Uses two levels of caching:
+        1. file_path + mtime — fast path when the exact same file is unchanged.
+        2. (notebook, section, content_hash) — reuses embeddings for pages
+           whose content is identical even when the backup file was replaced
+           by a newer snapshot with a different filename.
 
         Args:
             notebooks: Output of _discover_notebooks().
@@ -52,9 +68,19 @@ class EmbeddingIndex:
                 "index": i,
             }
 
+        # Build secondary lookup: (notebook, section, content_hash) -> index
+        # for matching unchanged pages across backup file renames.
+        hash_lookup: dict[tuple[str, str, str], int] = {}
+        for i, m in enumerate(self._metadata):
+            ch = m.get("content_hash")
+            if ch:
+                hash_lookup[(m["notebook"], m["section"], ch)] = i
+
         # Collect all pages that need (re-)embedding
         new_chunks: list[dict] = []
         keep_indices: list[int] = []
+        # Metadata updates for hash-matched entries (index -> new metadata fields)
+        meta_patches: dict[int, dict] = {}
         current_paths: set[str] = set()
 
         for nb_name, nb_info in notebooks.items():
@@ -71,27 +97,46 @@ class EmbeddingIndex:
                             keep_indices.append(i)
                     continue
 
-                # File is new or changed — parse and prepare for embedding
+                # File is new or changed — re-parse (cheap ~100ms)
                 pages = parse_pages_fn(filepath)
                 for page in pages:
                     full_text = "\n".join(page["texts"])
                     if not full_text.strip():
                         continue
+
+                    content_hash = self._content_hash(page["title"], full_text)
+
+                    # Check if an identical page already has an embedding
+                    hash_key = (nb_name, sec_name, content_hash)
+                    matched_idx = hash_lookup.get(hash_key)
+                    if matched_idx is not None and matched_idx not in keep_indices:
+                        keep_indices.append(matched_idx)
+                        # Update file_path/mtime so the fast path works next time
+                        meta_patches[matched_idx] = {
+                            "file_path": fpath_str,
+                            "file_mtime": file_mtime,
+                        }
+                        continue
+
                     chunk_text = f"{page['title']}\n{full_text}"
                     new_chunks.append({
                         "notebook": nb_name,
                         "section": sec_name,
                         "page_title": page["title"],
                         "text": full_text,
+                        "content_hash": content_hash,
                         "file_path": fpath_str,
                         "file_mtime": file_mtime,
                         "_embed_text": chunk_text,
                     })
 
-        # Remove entries for files that no longer exist
-        for i, m in enumerate(self._metadata):
-            if m["file_path"] not in current_paths and i in keep_indices:
-                keep_indices.remove(i)
+        # Remove entries whose files no longer exist AND that weren't kept
+        # (keep_indices already contains only valid entries)
+        final_keep: list[int] = []
+        for i in keep_indices:
+            if self._metadata[i]["file_path"] in current_paths or i in meta_patches:
+                final_keep.append(i)
+        keep_indices = final_keep
 
         # Build new embeddings for changed/new chunks
         if new_chunks:
@@ -112,6 +157,10 @@ class EmbeddingIndex:
         if keep_indices and self._embeddings is not None:
             kept_embeds = self._embeddings[keep_indices]
             kept_meta = [self._metadata[i] for i in keep_indices]
+            # Apply metadata patches (updated file_path/mtime for hash-matched)
+            for list_pos, orig_idx in enumerate(keep_indices):
+                if orig_idx in meta_patches:
+                    kept_meta[list_pos] = {**kept_meta[list_pos], **meta_patches[orig_idx]}
         else:
             kept_embeds = np.empty((0, 384), dtype=np.float32)
             kept_meta = []
@@ -124,8 +173,10 @@ class EmbeddingIndex:
             self._metadata = kept_meta
 
         total = len(self._metadata)
-        log.info("Index contains %d pages total (%d new/changed, %d kept)",
-                 total, len(new_chunks) if new_chunks else 0, len(keep_indices))
+        n_new = len(new_chunks) if new_chunks else 0
+        n_hash_matched = sum(1 for i in keep_indices if i in meta_patches)
+        log.info("Index contains %d pages total (%d new/changed, %d hash-matched, %d kept)",
+                 total, n_new, n_hash_matched, len(keep_indices) - n_hash_matched)
 
         if total > 0:
             self.save()
