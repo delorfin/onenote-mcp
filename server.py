@@ -38,6 +38,7 @@ from pathlib import Path
 from pyOneNote.OneDocument import OneDocment
 from mcp.server.fastmcp import FastMCP
 from vector_index import EmbeddingIndex
+from ocr import ocr_image
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -169,6 +170,7 @@ def _parse_pages(filepath: Path) -> list[dict]:
     Returns a list of dicts: [{"title": "...", "texts": ["block1", ...]}, ...]
     Uses jcidPageMetaData (CachedTitleString) as page boundaries and
     jcidRichTextOENode (RichEditTextUnicode) for text content.
+    Also extracts embedded images via jcidImageNode and runs OCR on them.
     """
     pages = []
     try:
@@ -178,6 +180,22 @@ def _parse_pages(filepath: Path) -> list[dict]:
         props = doc.get_properties()
         current_page = None
         seen_titles: set[str] = set()
+
+        # Build a lookup from identity string -> file info for image cross-referencing
+        files = {}
+        try:
+            files = doc.get_files()
+        except Exception as e:
+            log.debug("Could not get files from %s: %s", filepath, e)
+        file_by_identity: dict[str, dict] = {}
+        for guid, finfo in files.items():
+            identity = finfo.get("identity", "")
+            if identity:
+                file_by_identity[identity] = {**finfo, "guid": guid}
+
+        # Collect image references per page, then OCR after loop
+        image_refs_per_page: list[list[str]] = []  # parallel to pages
+        current_image_refs: list[str] = []
 
         for prop in props:
             ptype = prop.get("type", "")
@@ -191,20 +209,65 @@ def _parse_pages(filepath: Path) -> list[dict]:
                     seen_titles.add(title)
                     if current_page:
                         pages.append(current_page)
+                        image_refs_per_page.append(current_image_refs)
                     current_page = {"title": title, "texts": []}
+                    current_image_refs = []
 
             if current_page and ptype == "jcidRichTextOENode":
                 text = val.get("RichEditTextUnicode", "")
                 if text and isinstance(text, str) and text.strip():
                     current_page["texts"].append(text.strip())
 
+            if current_page and ptype == "jcidImageNode":
+                pic_ref = val.get("PictureContainer")
+                if isinstance(pic_ref, list) and pic_ref:
+                    current_image_refs.append(pic_ref[0])
+
         if current_page:
             pages.append(current_page)
+            image_refs_per_page.append(current_image_refs)
+
+        # OCR images and append text to respective pages
+        if file_by_identity:
+            _ocr_page_images(pages, image_refs_per_page, file_by_identity)
 
     except Exception as e:
         log.warning("Failed to parse pages from %s: %s", filepath, e)
 
     return pages
+
+
+_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".tif"}
+
+
+def _ocr_page_images(
+    pages: list[dict],
+    image_refs_per_page: list[list[str]],
+    file_by_identity: dict[str, dict],
+) -> None:
+    """Run OCR on images referenced by each page and append text to page texts."""
+    for page, refs in zip(pages, image_refs_per_page):
+        for ref_str in refs:
+            finfo = file_by_identity.get(ref_str)
+            if not finfo:
+                continue
+            ext = finfo.get("extension", "")
+            if not ext:
+                continue
+            if not ext.startswith("."):
+                ext = "." + ext
+            if ext.lower() not in _IMAGE_EXTENSIONS:
+                continue
+            content = finfo.get("content")
+            if not content or not isinstance(content, bytes):
+                continue
+            try:
+                text = ocr_image(content)
+                if text and text.strip():
+                    page["texts"].append(f"[OCR from image]: {text.strip()}")
+                    log.debug("OCR extracted %d chars for page '%s'", len(text), page["title"])
+            except Exception as e:
+                log.debug("OCR failed for image in page '%s': %s", page["title"], e)
 
 
 def _parse_one_file(filepath: Path) -> list[str]:

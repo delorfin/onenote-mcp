@@ -7,6 +7,8 @@ requires-python = ">=3.12"
 dependencies = [
     "mcp[cli]>=1.26.0",
     "numpy",
+    "pyobjc-framework-Quartz; sys_platform == 'darwin'",
+    "pyobjc-framework-Vision; sys_platform == 'darwin'",
     "pyonenote @ git+https://github.com/delorfin/pyOneNote.git",
     "sentence-transformers",
 ]
