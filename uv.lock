@@ -944,7 +944,7 @@ wheels = [
 [[package]]
 name = "pyonenote"
 version = "0.0.2"
-source = { git = "https://github.com/delorfin/pyOneNote.git#dc51f4ac1d1b27ecd0a23d06a8161581b9e044c1" }
+source = { git = "https://github.com/delorfin/pyOneNote.git#43181b4a18a709aec127c2fe5819905d240ad643" }
 
 [[package]]
 name = "python-dotenv"
