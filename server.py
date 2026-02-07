@@ -13,7 +13,7 @@ Writing: uses the OneNote COM API via PowerShell (requires OneNote desktop app).
 It exposes tools for Claude Code to:
     - List all notebooks and sections
     - Read page text content
-    - Search across all pages
+    - Search across all pages (semantic + exact match)
     - Create new pages in any notebook/section
     - Append content to existing pages
 
@@ -37,6 +37,7 @@ from pathlib import Path
 
 from pyOneNote.OneDocument import OneDocment
 from mcp.server.fastmcp import FastMCP
+from vector_index import EmbeddingIndex
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -44,13 +45,20 @@ from mcp.server.fastmcp import FastMCP
 
 # Where OneNote stores local backup files.
 # Override with ONENOTE_BACKUP_DIR environment variable if yours is elsewhere.
-DEFAULT_BACKUP_DIR = Path(
-    os.environ.get("APPDATA", ""),
-).parent / "Local" / "Microsoft" / "OneNote" / "16.0" / "Backup"
+if sys.platform == "darwin":
+    _container = Path.home() / "Library" / "Containers" / "com.microsoft.onenote.mac"
+    _base = _container / "Data" / "Library" / "Application Support" / "Microsoft User Data" / "OneNote" / "15.0"
+    # "Sicherung" is the German-locale name for "Backup"; check both
+    DEFAULT_BACKUP_DIRS = [_base / "Sicherung", _base / "Backup"]
+else:
+    _win_base = Path(os.environ.get("APPDATA", "")).parent / "Local" / "Microsoft" / "OneNote" / "16.0"
+    DEFAULT_BACKUP_DIRS = [_win_base / "Backup"]
 
-ONENOTE_DIR = Path(
-    os.environ.get("ONENOTE_BACKUP_DIR", str(DEFAULT_BACKUP_DIR))
-)
+ONENOTE_DIRS: list[Path] = []
+if os.environ.get("ONENOTE_BACKUP_DIR"):
+    ONENOTE_DIRS = [Path(os.environ["ONENOTE_BACKUP_DIR"])]
+else:
+    ONENOTE_DIRS = [d for d in DEFAULT_BACKUP_DIRS if d.exists()]
 
 # ---------------------------------------------------------------------------
 # Logging (to stderr so it doesn't break stdio MCP transport)
@@ -76,7 +84,7 @@ log.info("Log file: %s", LOG_FILE)
 
 def _discover_notebooks() -> dict[str, dict]:
     """
-    Scan the OneNote backup directory and build a notebook → section → files map.
+    Scan the OneNote backup directory and build a notebook -> section -> files map.
 
     Returns a dict like:
     {
@@ -93,111 +101,123 @@ def _discover_notebooks() -> dict[str, dict]:
         ...
     }
     """
-    if not ONENOTE_DIR.exists():
-        log.error("OneNote backup directory not found: %s", ONENOTE_DIR)
+    if not ONENOTE_DIRS:
+        log.error("No OneNote backup directories found")
         return {}
 
     notebooks = {}
-    for notebook_dir in ONENOTE_DIR.iterdir():
-        if not notebook_dir.is_dir():
+    for onenote_dir in ONENOTE_DIRS:
+        if not onenote_dir.exists():
             continue
-
-        notebook_name = notebook_dir.name
-        sections: dict[str, dict] = {}
-
-        # Walk all .one files in this notebook (including subdirectories)
-        for one_file in notebook_dir.rglob("*.one"):
-            # Skip recycle bin
-            if "RecycleBin" in str(one_file):
+        for notebook_dir in onenote_dir.iterdir():
+            if not notebook_dir.is_dir():
                 continue
 
-            # Extract the base section name (strip the date suffix)
-            # e.g. "Algorithm (On 1-4-2026).one" → "Algorithm"
-            # e.g. "Python.one (On 12-6-2025).one" → "Python"
-            fname = one_file.name
-            # Remove .one extension(s) and date suffixes
-            section_name = re.sub(r"\.one$", "", fname)
-            section_name = re.sub(r"\s*\(On \d+-\d+-\d+\)$", "", section_name)
-            section_name = re.sub(r"\.one$", "", section_name)  # handle double .one
-            section_name = section_name.strip()
+            notebook_name = notebook_dir.name
 
-            if not section_name:
-                section_name = "(unnamed)"
+            # Merge into existing entry if notebook already found in another dir
+            if notebook_name not in notebooks:
+                notebooks[notebook_name] = {
+                    "path": notebook_dir,
+                    "sections": {},
+                }
+            sections = notebooks[notebook_name]["sections"]
 
-            # Build relative path for context (subfolder within notebook)
-            rel_parts = one_file.parent.relative_to(notebook_dir).parts
-            if rel_parts:
-                section_key = "/".join(rel_parts) + "/" + section_name
-            else:
-                section_key = section_name
+            # Walk all .one files in this notebook (including subdirectories)
+            for one_file in notebook_dir.rglob("*.one"):
+                # Skip recycle bin
+                if "RecycleBin" in str(one_file):
+                    continue
 
-            if section_key not in sections:
-                sections[section_key] = {"files": [], "latest": None}
+                # Extract the base section name (strip the date suffix)
+                # e.g. "Algorithm (On 1-4-2026).one" -> "Algorithm"
+                # e.g. "Daily (On 02.02.26).one" -> "Daily"
+                fname = one_file.name
+                # Remove .one extension(s) and date suffixes
+                section_name = re.sub(r"\.one$", "", fname)
+                section_name = re.sub(r"\s*\(On [\d.\-]+\)$", "", section_name)
+                section_name = re.sub(r"\.one$", "", section_name)  # handle double .one
+                section_name = section_name.strip()
 
-            sections[section_key]["files"].append(one_file)
+                if not section_name:
+                    section_name = "(unnamed)"
 
-        # For each section, determine the latest (most recently modified) file
-        for sec_info in sections.values():
-            sec_info["files"].sort(key=lambda p: p.stat().st_mtime, reverse=True)
-            sec_info["latest"] = sec_info["files"][0]
+                # Build relative path for context (subfolder within notebook)
+                rel_parts = one_file.parent.relative_to(notebook_dir).parts
+                if rel_parts:
+                    section_key = "/".join(rel_parts) + "/" + section_name
+                else:
+                    section_key = section_name
 
-        if sections:
-            notebooks[notebook_name] = {
-                "path": notebook_dir,
-                "sections": sections,
-            }
+                if section_key not in sections:
+                    sections[section_key] = {"files": [], "latest": None}
+
+                sections[section_key]["files"].append(one_file)
+
+            # For each section, determine the latest (most recently modified) file
+            for sec_info in sections.values():
+                sec_info["files"].sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                sec_info["latest"] = sec_info["files"][0]
 
     return notebooks
 
 
-def _parse_one_file(filepath: Path) -> list[str]:
+def _parse_pages(filepath: Path) -> list[dict]:
     """
-    Parse a .one file and extract all text content.
+    Parse a .one file and extract pages with titles and text content.
 
-    Returns a list of text strings found in the file.
+    Returns a list of dicts: [{"title": "...", "texts": ["block1", ...]}, ...]
+    Uses jcidPageMetaData (CachedTitleString) as page boundaries and
+    jcidRichTextOENode (RichEditTextUnicode) for text content.
     """
-    texts = []
+    pages = []
     try:
         with open(filepath, "rb") as f:
             doc = OneDocment(f)
 
         props = doc.get_properties()
+        current_page = None
+        seen_titles: set[str] = set()
+
         for prop in props:
             ptype = prop.get("type", "")
             val = prop.get("val", {})
             if not isinstance(val, dict):
                 continue
 
-            # Extract RichEditTextUnicode (the actual text content)
-            text = val.get("RichEditTextUnicode", "")
-            if text and isinstance(text, str) and text.strip():
-                texts.append(text.strip())
+            if ptype == "jcidPageMetaData":
+                title = val.get("CachedTitleString", "").replace("\x00", "").strip()
+                if title and title not in seen_titles:
+                    seen_titles.add(title)
+                    if current_page:
+                        pages.append(current_page)
+                    current_page = {"title": title, "texts": []}
+
+            if current_page and ptype == "jcidRichTextOENode":
+                text = val.get("RichEditTextUnicode", "")
+                if text and isinstance(text, str) and text.strip():
+                    current_page["texts"].append(text.strip())
+
+        if current_page:
+            pages.append(current_page)
 
     except Exception as e:
-        log.warning("Failed to parse %s: %s", filepath, e)
+        log.warning("Failed to parse pages from %s: %s", filepath, e)
 
+    return pages
+
+
+def _parse_one_file(filepath: Path) -> list[str]:
+    """
+    Parse a .one file and extract all text content.
+
+    Returns a flat list of text strings found in the file.
+    """
+    pages = _parse_pages(filepath)
+    texts = []
+    for page in pages:
+        texts.extend(page["texts"])
     return texts
-
-
-def _get_page_titles_from_props(filepath: Path) -> list[str]:
-    """Extract page titles from a .one file."""
-    titles = []
-    try:
-        with open(filepath, "rb") as f:
-            doc = OneDocment(f)
-
-        props = doc.get_properties()
-        for prop in props:
-            if prop.get("type") == "jcidTitleNode":
-                val = prop.get("val", {})
-                if isinstance(val, dict):
-                    text = val.get("RichEditTextUnicode", "")
-                    if text and text.strip():
-                        titles.append(text.strip())
-    except Exception as e:
-        log.warning("Failed to extract titles from %s: %s", filepath, e)
-
-    return titles
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +225,9 @@ def _get_page_titles_from_props(filepath: Path) -> list[str]:
 # ---------------------------------------------------------------------------
 
 mcp = FastMCP("onenote")
+
+# Global search index (initialized at startup)
+_search_index: EmbeddingIndex | None = None
 
 
 @mcp.tool()
@@ -215,7 +238,7 @@ async def list_notebooks() -> str:
     """
     notebooks = _discover_notebooks()
     if not notebooks:
-        return f"No notebooks found in {ONENOTE_DIR}"
+        return f"No notebooks found in {ONENOTE_DIRS}"
 
     lines = []
     for name, info in sorted(notebooks.items()):
@@ -255,6 +278,8 @@ async def list_sections(notebook_name: str) -> str:
 async def read_section(notebook_name: str, section_name: str) -> str:
     """Read all text content from a specific section of a notebook.
 
+    Shows content organized by page with titles.
+
     Args:
         notebook_name: The name of the notebook.
         section_name: The name of the section (from list_sections).
@@ -282,24 +307,93 @@ async def read_section(notebook_name: str, section_name: str) -> str:
         return f"Section '{section_name}' not found. Available: {available}"
 
     filepath = sec_info["latest"]
-    texts = _parse_one_file(filepath)
+    pages = _parse_pages(filepath)
 
-    if not texts:
+    if not pages:
         return f"No text content found in section '{section_name}'."
 
-    return "\n\n".join(texts)
+    lines = []
+    for page in pages:
+        lines.append(f"## {page['title']}")
+        if page["texts"]:
+            lines.append("\n\n".join(page["texts"]))
+        else:
+            lines.append("(no text content)")
+        lines.append("")
+
+    return "\n\n".join(lines)
 
 
 @mcp.tool()
-async def search_notes(query: str) -> str:
-    """Search for text across ALL notebooks and sections.
-
-    Searches through the text content of every section for the given query.
-    Returns matching sections with a snippet of the matched text.
+async def read_page(notebook_name: str, section_name: str, page_title: str) -> str:
+    """Read a specific page by title from a notebook section.
 
     Args:
-        query: The text to search for (case-insensitive).
+        notebook_name: The name of the notebook.
+        section_name: The name of the section.
+        page_title: The title of the page (from read_section output).
     """
+    notebooks = _discover_notebooks()
+
+    nb = None
+    for key, val in notebooks.items():
+        if key.lower() == notebook_name.lower():
+            nb = val
+            break
+    if nb is None:
+        available = ", ".join(sorted(notebooks.keys()))
+        return f"Notebook '{notebook_name}' not found. Available: {available}"
+
+    sec_info = None
+    for key, val in nb["sections"].items():
+        if key.lower() == section_name.lower():
+            sec_info = val
+            break
+    if sec_info is None:
+        available = ", ".join(sorted(nb["sections"].keys()))
+        return f"Section '{section_name}' not found. Available: {available}"
+
+    filepath = sec_info["latest"]
+    pages = _parse_pages(filepath)
+
+    for page in pages:
+        if page["title"].lower() == page_title.lower():
+            if not page["texts"]:
+                return f"Page '{page['title']}' exists but has no text content."
+            return f"# {page['title']}\n\n" + "\n\n".join(page["texts"])
+
+    available_pages = [p["title"] for p in pages]
+    return f"Page '{page_title}' not found. Available pages: {', '.join(available_pages)}"
+
+
+@mcp.tool()
+async def search_notes(query: str, exact_match: bool = False) -> str:
+    """Search for text across ALL notebooks and sections.
+
+    By default uses semantic search (finds conceptually related content).
+    Set exact_match=True for literal substring matching.
+
+    Args:
+        query: The text to search for.
+        exact_match: If True, use exact substring matching (case-insensitive).
+                     If False (default), use semantic similarity search.
+    """
+    if not exact_match and _search_index is not None:
+        matches = _search_index.search(query, top_k=20)
+        if not matches:
+            return f"No results found for '{query}'."
+        lines = [f"Found {len(matches)} match(es) for '{query}' (semantic search):\n"]
+        for m in matches:
+            score = m["score"]
+            nb = m["notebook"]
+            sec = m["section"]
+            title = m["page_title"]
+            text = m["text"]
+            snippet = text[:200] + "..." if len(text) > 200 else text
+            lines.append(f'[{nb} / {sec} / "{title}"]  (score: {score:.2f})\n  {snippet}')
+        return "\n\n".join(lines)
+
+    # Exact match fallback
     query_lower = query.lower()
     notebooks = _discover_notebooks()
     results = []
@@ -307,29 +401,47 @@ async def search_notes(query: str) -> str:
     for nb_name, nb_info in sorted(notebooks.items()):
         for sec_name, sec_info in sorted(nb_info["sections"].items()):
             filepath = sec_info["latest"]
-            texts = _parse_one_file(filepath)
+            pages = _parse_pages(filepath)
 
-            for text in texts:
-                if query_lower in text.lower():
-                    # Build a snippet around the match
-                    idx = text.lower().index(query_lower)
-                    start = max(0, idx - 80)
-                    end = min(len(text), idx + len(query) + 80)
-                    snippet = text[start:end].strip()
-                    if start > 0:
-                        snippet = "..." + snippet
-                    if end < len(text):
-                        snippet = snippet + "..."
+            for page in pages:
+                for text in page["texts"]:
+                    if query_lower in text.lower():
+                        idx = text.lower().index(query_lower)
+                        start = max(0, idx - 80)
+                        end = min(len(text), idx + len(query) + 80)
+                        snippet = text[start:end].strip()
+                        if start > 0:
+                            snippet = "..." + snippet
+                        if end < len(text):
+                            snippet = snippet + "..."
 
-                    results.append(
-                        f"[{nb_name} / {sec_name}]\n  {snippet}"
-                    )
+                        results.append(
+                            f'[{nb_name} / {sec_name} / "{page["title"]}"]'
+                            f"\n  {snippet}"
+                        )
 
     if not results:
         return f"No results found for '{query}'."
 
-    header = f"Found {len(results)} match(es) for '{query}':\n\n"
-    return header + "\n\n".join(results[:30])  # limit to 30 results
+    header = f"Found {len(results)} match(es) for '{query}' (exact match):\n\n"
+    return header + "\n\n".join(results[:30])
+
+
+@mcp.tool()
+async def rebuild_search_index() -> str:
+    """Rebuild the semantic search index from all notebooks.
+
+    Use this if you've added new content and want it to be searchable,
+    or if the index seems stale.
+    """
+    global _search_index
+    notebooks = _discover_notebooks()
+    if not notebooks:
+        return "No notebooks found -- nothing to index."
+
+    _search_index = EmbeddingIndex()
+    count = _search_index.build(notebooks, _parse_pages)
+    return f"Search index rebuilt: {count} pages indexed."
 
 
 @mcp.tool()
@@ -340,7 +452,7 @@ async def list_all_sections() -> str:
     """
     notebooks = _discover_notebooks()
     if not notebooks:
-        return f"No notebooks found in {ONENOTE_DIR}"
+        return f"No notebooks found in {ONENOTE_DIRS}"
 
     lines = []
     for nb_name, nb_info in sorted(notebooks.items()):
@@ -696,121 +808,139 @@ def _com_list_pages(section_id: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# MCP Write Tools
+# MCP Write Tools (Windows only -- requires OneNote COM API via PowerShell)
 # ---------------------------------------------------------------------------
 
+if sys.platform == "win32":
 
-@mcp.tool()
-async def list_live_notebooks() -> str:
-    """List notebooks from the running OneNote app (live, not backup files).
+    @mcp.tool()
+    async def list_live_notebooks() -> str:
+        """List notebooks from the running OneNote app (live, not backup files).
 
-    This uses the OneNote COM API and shows the notebooks currently open in
-    the OneNote desktop app, including their sections. Use this to find
-    where to create new pages.
-    """
-    root = _com_get_hierarchy(3)
-    if root is None:
-        return "Could not connect to OneNote. Make sure the OneNote desktop app is installed."
+        This uses the OneNote COM API and shows the notebooks currently open in
+        the OneNote desktop app, including their sections. Use this to find
+        where to create new pages.
+        """
+        root = _com_get_hierarchy(3)
+        if root is None:
+            return "Could not connect to OneNote. Make sure the OneNote desktop app is installed."
 
-    lines = []
-    for nb in root.findall(f"{{{ONE_NS}}}Notebook"):
-        nb_name = nb.get("name", "?")
-        lines.append(f"\n## {nb_name}")
-        for sec in nb.iter(f"{{{ONE_NS}}}Section"):
-            if sec.get("isInRecycleBin") == "true":
-                continue
-            sec_name = sec.get("name", "?")
-            locked = " (locked)" if sec.get("locked") == "true" else ""
-            lines.append(f"  - {sec_name}{locked}")
+        lines = []
+        for nb in root.findall(f"{{{ONE_NS}}}Notebook"):
+            nb_name = nb.get("name", "?")
+            lines.append(f"\n## {nb_name}")
+            for sec in nb.iter(f"{{{ONE_NS}}}Section"):
+                if sec.get("isInRecycleBin") == "true":
+                    continue
+                sec_name = sec.get("name", "?")
+                locked = " (locked)" if sec.get("locked") == "true" else ""
+                lines.append(f"  - {sec_name}{locked}")
 
-    if not lines:
-        return "No notebooks found in OneNote."
-    return "\n".join(lines)
+        if not lines:
+            return "No notebooks found in OneNote."
+        return "\n".join(lines)
 
+    @mcp.tool()
+    async def create_page(notebook_name: str, section_name: str, title: str, content: str) -> str:
+        """Create a new page in a OneNote notebook section.
 
-@mcp.tool()
-async def create_page(notebook_name: str, section_name: str, title: str, content: str) -> str:
-    """Create a new page in a OneNote notebook section.
+        The content is written as HTML. You can use basic HTML tags like
+        <b>, <i>, <br>, <ul>, <li>, <h1>-<h6>, etc.
 
-    The content is written as HTML. You can use basic HTML tags like
-    <b>, <i>, <br>, <ul>, <li>, <h1>-<h6>, etc.
+        Requires the OneNote desktop app to be installed.
 
-    Requires the OneNote desktop app to be installed.
+        Args:
+            notebook_name: Name of the notebook (from list_live_notebooks).
+            section_name: Name of the section within the notebook.
+            title: Title for the new page.
+            content: The page content (plain text or HTML).
+        """
+        section_id = _com_find_section_id(notebook_name, section_name)
+        if section_id is None:
+            return (
+                f"Could not find section '{section_name}' in notebook '{notebook_name}'. "
+                f"Use list_live_notebooks to see available notebooks and sections."
+            )
 
-    Args:
-        notebook_name: Name of the notebook (from list_live_notebooks).
-        section_name: Name of the section within the notebook.
-        title: Title for the new page.
-        content: The page content (plain text or HTML).
-    """
-    section_id = _com_find_section_id(notebook_name, section_name)
-    if section_id is None:
-        return (
-            f"Could not find section '{section_name}' in notebook '{notebook_name}'. "
-            f"Use list_live_notebooks to see available notebooks and sections."
-        )
+        ok, msg = _com_create_page(section_id, title, content)
+        return msg
 
-    ok, msg = _com_create_page(section_id, title, content)
-    return msg
+    @mcp.tool()
+    async def list_live_pages(notebook_name: str, section_name: str) -> str:
+        """List pages in a section from the running OneNote app.
 
+        Use this to find page IDs for appending content to existing pages.
 
-@mcp.tool()
-async def list_live_pages(notebook_name: str, section_name: str) -> str:
-    """List pages in a section from the running OneNote app.
+        Args:
+            notebook_name: Name of the notebook.
+            section_name: Name of the section.
+        """
+        section_id = _com_find_section_id(notebook_name, section_name)
+        if section_id is None:
+            return (
+                f"Could not find section '{section_name}' in notebook '{notebook_name}'. "
+                f"Use list_live_notebooks to see available notebooks and sections."
+            )
 
-    Use this to find page IDs for appending content to existing pages.
+        pages = _com_list_pages(section_id)
+        if not pages:
+            return "No pages found in this section."
 
-    Args:
-        notebook_name: Name of the notebook.
-        section_name: Name of the section.
-    """
-    section_id = _com_find_section_id(notebook_name, section_name)
-    if section_id is None:
-        return (
-            f"Could not find section '{section_name}' in notebook '{notebook_name}'. "
-            f"Use list_live_notebooks to see available notebooks and sections."
-        )
+        lines = []
+        for p in pages:
+            lines.append(f"- {p['name']}  (id: {p['id']})")
+        return "\n".join(lines)
 
-    pages = _com_list_pages(section_id)
-    if not pages:
-        return "No pages found in this section."
+    @mcp.tool()
+    async def append_to_page(page_id: str, content: str) -> str:
+        """Append content to an existing OneNote page.
 
-    lines = []
-    for p in pages:
-        lines.append(f"- {p['name']}  (id: {p['id']})")
-    return "\n".join(lines)
+        The content is added as a new outline block at the bottom of the page.
+        Supports HTML formatting (<b>, <i>, <br>, <ul>, <li>, etc.).
 
-
-@mcp.tool()
-async def append_to_page(page_id: str, content: str) -> str:
-    """Append content to an existing OneNote page.
-
-    The content is added as a new outline block at the bottom of the page.
-    Supports HTML formatting (<b>, <i>, <br>, <ul>, <li>, etc.).
-
-    Args:
-        page_id: The page ID (from list_live_pages).
-        content: The content to append (plain text or HTML).
-    """
-    ok, msg = _com_append_to_page(page_id, content)
-    return msg
+        Args:
+            page_id: The page ID (from list_live_pages).
+            content: The content to append (plain text or HTML).
+        """
+        ok, msg = _com_append_to_page(page_id, content)
+        return msg
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _build_search_index():
+    """Build or update the semantic search index."""
+    global _search_index
+    notebooks = _discover_notebooks()
+    if not notebooks:
+        log.warning("No notebooks found, skipping search index build")
+        return
+
+    try:
+        _search_index = EmbeddingIndex()
+        count = _search_index.build(notebooks, _parse_pages)
+        log.info("Search index ready: %d pages indexed", count)
+    except Exception as e:
+        log.warning("Failed to build search index: %s (semantic search disabled)", e)
+        _search_index = None
+
+
 def main():
-    if not ONENOTE_DIR.exists():
+    if not ONENOTE_DIRS:
         log.error(
-            "OneNote backup directory not found: %s\n"
+            "No OneNote backup directories found. Checked: %s\n"
             "Set the ONENOTE_BACKUP_DIR environment variable to the correct path.",
-            ONENOTE_DIR,
+            DEFAULT_BACKUP_DIRS,
         )
         sys.exit(1)
 
     log.info("Starting OneNote MCP server (local files)...")
-    log.info("Reading from: %s", ONENOTE_DIR)
+    log.info("Reading from: %s", ONENOTE_DIRS)
+
+    _build_search_index()
+
     mcp.run(transport="stdio")
 
 

@@ -6,5 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "mcp[cli]>=1.26.0",
-    "pyonenote>=0.0.2",
+    "numpy",
+    "pyonenote @ git+https://github.com/delorfin/pyOneNote.git",
+    "sentence-transformers",
 ]
