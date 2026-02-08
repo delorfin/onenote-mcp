@@ -1,26 +1,19 @@
 """
-OneNote MCP Server (Local Files)
-=================================
-An MCP (Model Context Protocol) server that reads local OneNote (.one) files
-directly from disk and writes to OneNote via the COM API.
-No Azure registration or authentication needed.
+OneNote MCP Server
+==================
+An MCP (Model Context Protocol) server that gives Claude access to your
+Microsoft OneNote notebooks.
 
-Reading: parses backup files at:
-    C:\\Users\\<user>\\AppData\\Local\\Microsoft\\OneNote\\16.0\\Backup\\
+**Reading** (two sources):
+  - Local backup files (default) — fast, offline, no auth
+  - Microsoft Graph API — live/current data, requires one-time authentication
 
-Writing: uses the OneNote COM API via PowerShell (requires OneNote desktop app).
-
-It exposes tools for Claude Code to:
-    - List all notebooks and sections
-    - Read page text content
-    - Search across all pages (semantic + exact match)
-    - Create new pages in any notebook/section
-    - Append content to existing pages
+**Writing** (all platforms via Graph API, or COM API on Windows):
+  - Create pages in any notebook/section
+  - Append content to existing pages
 
 Prerequisites:
-    pip install "mcp[cli]" pyOneNote
-    (or: uv add "mcp[cli]" pyOneNote)
-    + OneNote desktop app (for write features)
+    uv sync  (installs all dependencies)
 
 Usage with Claude Code:
     claude mcp add --transport stdio onenote -- uv --directory "path/to/this/project" run server.py
@@ -39,6 +32,8 @@ from pyOneNote.OneDocument import OneDocment
 from mcp.server.fastmcp import FastMCP
 from vector_index import EmbeddingIndex
 from ocr import ocr_image
+import graph_auth
+import graph_client
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -60,6 +55,27 @@ if os.environ.get("ONENOTE_BACKUP_DIR"):
     ONENOTE_DIRS = [Path(os.environ["ONENOTE_BACKUP_DIR"])]
 else:
     ONENOTE_DIRS = [d for d in DEFAULT_BACKUP_DIRS if d.exists()]
+
+# Data source settings: 'local' (backup files) or 'api' (Graph API)
+_DEFAULT_SOURCE = "local"
+_API_AVAILABLE = False
+
+
+def _check_api_availability() -> bool:
+    """Check if Graph API is available (authenticated)."""
+    global _API_AVAILABLE
+    try:
+        token = graph_auth.get_access_token()
+        _API_AVAILABLE = bool(token)
+    except Exception:
+        _API_AVAILABLE = False
+    return _API_AVAILABLE
+
+
+def _resolve_source(use_api: bool) -> str:
+    """Determine effective data source based on parameter and default."""
+    return "api" if use_api else _DEFAULT_SOURCE
+
 
 # ---------------------------------------------------------------------------
 # Logging (to stderr so it doesn't break stdio MCP transport)
@@ -293,16 +309,10 @@ mcp = FastMCP("onenote")
 _search_index: EmbeddingIndex | None = None
 
 
-@mcp.tool()
-async def list_notebooks() -> str:
-    """List all locally available OneNote notebooks.
-
-    Shows notebook names and how many sections each one has.
-    """
+def _list_notebooks_local() -> str:
     notebooks = _discover_notebooks()
     if not notebooks:
         return f"No notebooks found in {ONENOTE_DIRS}"
-
     lines = []
     for name, info in sorted(notebooks.items()):
         section_count = len(info["sections"])
@@ -310,16 +320,34 @@ async def list_notebooks() -> str:
     return "\n".join(lines)
 
 
+def _list_notebooks_api() -> str:
+    nbs = graph_client.list_notebooks_graph()
+    if not nbs:
+        return "No notebooks found via Graph API."
+    lines = []
+    for nb in nbs:
+        lines.append(f"- {nb['displayName']}  ({nb['section_count']} sections)")
+    return "\n".join(lines)
+
+
 @mcp.tool()
-async def list_sections(notebook_name: str) -> str:
-    """List all sections in a specific notebook.
+async def list_notebooks(use_api: bool = False) -> str:
+    """List all available OneNote notebooks.
 
     Args:
-        notebook_name: The name of the notebook (from list_notebooks).
+        use_api: If True, use live API data instead of local backup files.
     """
+    source = _resolve_source(use_api)
+    if source == "api":
+        if not _check_api_availability():
+            return "API access requires authentication. Run 'authenticate' tool first."
+        return _list_notebooks_api()
+    return _list_notebooks_local()
+
+
+def _list_sections_local(notebook_name: str) -> str:
     notebooks = _discover_notebooks()
     if notebook_name not in notebooks:
-        # Try case-insensitive match
         for key in notebooks:
             if key.lower() == notebook_name.lower():
                 notebook_name = key
@@ -327,7 +355,6 @@ async def list_sections(notebook_name: str) -> str:
         else:
             available = ", ".join(sorted(notebooks.keys()))
             return f"Notebook '{notebook_name}' not found. Available: {available}"
-
     sections = notebooks[notebook_name]["sections"]
     lines = []
     for sec_name, sec_info in sorted(sections.items()):
@@ -337,19 +364,37 @@ async def list_sections(notebook_name: str) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
-async def read_section(notebook_name: str, section_name: str) -> str:
-    """Read all text content from a specific section of a notebook.
+def _list_sections_api(notebook_name: str) -> str:
+    secs = graph_client.list_sections_graph(notebook_name)
+    if secs is None:
+        available = [nb["displayName"] for nb in graph_client.list_notebooks_graph()]
+        return f"Notebook '{notebook_name}' not found. Available: {', '.join(available)}"
+    if not secs:
+        return f"No sections found in '{notebook_name}'."
+    lines = []
+    for sec in secs:
+        lines.append(f"- {sec['displayName']}")
+    return "\n".join(lines)
 
-    Shows content organized by page with titles.
+
+@mcp.tool()
+async def list_sections(notebook_name: str, use_api: bool = False) -> str:
+    """List all sections in a specific notebook.
 
     Args:
-        notebook_name: The name of the notebook.
-        section_name: The name of the section (from list_sections).
+        notebook_name: The name of the notebook (from list_notebooks).
+        use_api: If True, use live API data instead of local backup files.
     """
-    notebooks = _discover_notebooks()
+    source = _resolve_source(use_api)
+    if source == "api":
+        if not _check_api_availability():
+            return "API access requires authentication. Run 'authenticate' tool first."
+        return _list_sections_api(notebook_name)
+    return _list_sections_local(notebook_name)
 
-    # Case-insensitive notebook match
+
+def _read_section_local(notebook_name: str, section_name: str) -> str:
+    notebooks = _discover_notebooks()
     nb = None
     for key, val in notebooks.items():
         if key.lower() == notebook_name.lower():
@@ -358,8 +403,6 @@ async def read_section(notebook_name: str, section_name: str) -> str:
     if nb is None:
         available = ", ".join(sorted(notebooks.keys()))
         return f"Notebook '{notebook_name}' not found. Available: {available}"
-
-    # Case-insensitive section match
     sec_info = None
     for key, val in nb["sections"].items():
         if key.lower() == section_name.lower():
@@ -368,13 +411,10 @@ async def read_section(notebook_name: str, section_name: str) -> str:
     if sec_info is None:
         available = ", ".join(sorted(nb["sections"].keys()))
         return f"Section '{section_name}' not found. Available: {available}"
-
     filepath = sec_info["latest"]
     pages = _parse_pages(filepath)
-
     if not pages:
         return f"No text content found in section '{section_name}'."
-
     lines = []
     for page in pages:
         lines.append(f"## {page['title']}")
@@ -383,21 +423,42 @@ async def read_section(notebook_name: str, section_name: str) -> str:
         else:
             lines.append("(no text content)")
         lines.append("")
+    return "\n\n".join(lines)
 
+
+def _read_section_api(notebook_name: str, section_name: str) -> str:
+    pages = graph_client.read_section_graph(notebook_name, section_name)
+    if pages is None:
+        return f"Could not find section '{section_name}' in notebook '{notebook_name}'. Use list_notebooks(use_api=True) and list_sections(..., use_api=True) to browse."
+    if not pages:
+        return f"No pages found in section '{section_name}'."
+    lines = []
+    for page in pages:
+        lines.append(f"## {page['title']}")
+        lines.append(page["text"] if page["text"] else "(no text content)")
+        lines.append("")
     return "\n\n".join(lines)
 
 
 @mcp.tool()
-async def read_page(notebook_name: str, section_name: str, page_title: str) -> str:
-    """Read a specific page by title from a notebook section.
+async def read_section(notebook_name: str, section_name: str, use_api: bool = False) -> str:
+    """Read all text content from a specific section of a notebook.
 
     Args:
         notebook_name: The name of the notebook.
-        section_name: The name of the section.
-        page_title: The title of the page (from read_section output).
+        section_name: The name of the section (from list_sections).
+        use_api: If True, use live API data instead of local backup files.
     """
-    notebooks = _discover_notebooks()
+    source = _resolve_source(use_api)
+    if source == "api":
+        if not _check_api_availability():
+            return "API access requires authentication. Run 'authenticate' tool first."
+        return _read_section_api(notebook_name, section_name)
+    return _read_section_local(notebook_name, section_name)
 
+
+def _read_page_local(notebook_name: str, section_name: str, page_title: str) -> str:
+    notebooks = _discover_notebooks()
     nb = None
     for key, val in notebooks.items():
         if key.lower() == notebook_name.lower():
@@ -406,7 +467,6 @@ async def read_page(notebook_name: str, section_name: str, page_title: str) -> s
     if nb is None:
         available = ", ".join(sorted(notebooks.keys()))
         return f"Notebook '{notebook_name}' not found. Available: {available}"
-
     sec_info = None
     for key, val in nb["sections"].items():
         if key.lower() == section_name.lower():
@@ -415,32 +475,45 @@ async def read_page(notebook_name: str, section_name: str, page_title: str) -> s
     if sec_info is None:
         available = ", ".join(sorted(nb["sections"].keys()))
         return f"Section '{section_name}' not found. Available: {available}"
-
     filepath = sec_info["latest"]
     pages = _parse_pages(filepath)
-
     for page in pages:
         if page["title"].lower() == page_title.lower():
             if not page["texts"]:
                 return f"Page '{page['title']}' exists but has no text content."
             return f"# {page['title']}\n\n" + "\n\n".join(page["texts"])
-
     available_pages = [p["title"] for p in pages]
     return f"Page '{page_title}' not found. Available pages: {', '.join(available_pages)}"
 
 
-@mcp.tool()
-async def search_notes(query: str, exact_match: bool = False) -> str:
-    """Search for text across ALL notebooks and sections.
+def _read_page_api(notebook_name: str, section_name: str, page_title: str) -> str:
+    text = graph_client.read_page_graph(notebook_name, section_name, page_title)
+    if text is None:
+        return f"Could not find page '{page_title}' in '{notebook_name}/{section_name}'. Use list_pages(..., use_api=True) to see available pages."
+    if not text:
+        return f"Page '{page_title}' exists but has no text content."
+    return f"# {page_title}\n\n{text}"
 
-    By default uses semantic search (finds conceptually related content).
-    Set exact_match=True for literal substring matching.
+
+@mcp.tool()
+async def read_page(notebook_name: str, section_name: str, page_title: str, use_api: bool = False) -> str:
+    """Read a specific page by title from a notebook section.
 
     Args:
-        query: The text to search for.
-        exact_match: If True, use exact substring matching (case-insensitive).
-                     If False (default), use semantic similarity search.
+        notebook_name: The name of the notebook.
+        section_name: The name of the section.
+        page_title: The title of the page.
+        use_api: If True, use live API data instead of local backup files.
     """
+    source = _resolve_source(use_api)
+    if source == "api":
+        if not _check_api_availability():
+            return "API access requires authentication. Run 'authenticate' tool first."
+        return _read_page_api(notebook_name, section_name, page_title)
+    return _read_page_local(notebook_name, section_name, page_title)
+
+
+def _search_notes_local(query: str, exact_match: bool) -> str:
     if not exact_match:
         _ensure_search_index()
     if not exact_match and _search_index is not None:
@@ -457,17 +530,14 @@ async def search_notes(query: str, exact_match: bool = False) -> str:
             snippet = text[:200] + "..." if len(text) > 200 else text
             lines.append(f'[{nb} / {sec} / "{title}"]  (score: {score:.2f})\n  {snippet}')
         return "\n\n".join(lines)
-
     # Exact match fallback
     query_lower = query.lower()
     notebooks = _discover_notebooks()
     results = []
-
     for nb_name, nb_info in sorted(notebooks.items()):
         for sec_name, sec_info in sorted(nb_info["sections"].items()):
             filepath = sec_info["latest"]
             pages = _parse_pages(filepath)
-
             for page in pages:
                 for text in page["texts"]:
                     if query_lower in text.lower():
@@ -479,17 +549,46 @@ async def search_notes(query: str, exact_match: bool = False) -> str:
                             snippet = "..." + snippet
                         if end < len(text):
                             snippet = snippet + "..."
-
                         results.append(
                             f'[{nb_name} / {sec_name} / "{page["title"]}"]'
                             f"\n  {snippet}"
                         )
-
     if not results:
         return f"No results found for '{query}'."
-
     header = f"Found {len(results)} match(es) for '{query}' (exact match):\n\n"
     return header + "\n\n".join(results[:30])
+
+
+def _search_notes_api(query: str) -> str:
+    results = graph_client.search_pages_graph(query)
+    if not results:
+        return f"No results found for '{query}' via API."
+    lines = [f"Found {len(results)} match(es) for '{query}' (API title search):\n"]
+    for r in results:
+        section = r["section"] or "?"
+        lines.append(f'[{section} / "{r["title"]}"]  (modified: {r["modified"][:10]})')
+    return "\n\n".join(lines)
+
+
+@mcp.tool()
+async def search_notes(query: str, exact_match: bool = False, use_api: bool = False) -> str:
+    """Search for text across ALL notebooks and sections.
+
+    By default uses semantic search (finds conceptually related content).
+    Set exact_match=True for literal substring matching.
+
+    Args:
+        query: The text to search for.
+        exact_match: If True, use exact substring matching (case-insensitive).
+                     If False (default), use semantic similarity search.
+        use_api: If True, search via Graph API (title matching only).
+    """
+    source = _resolve_source(use_api)
+    if source == "api":
+        if not _check_api_availability():
+            return "API access requires authentication. Run 'authenticate' tool first."
+        return _search_notes_api(query)
+    return _search_notes_local(query, exact_match)
 
 
 @mcp.tool()
@@ -509,15 +608,34 @@ async def rebuild_search_index() -> str:
 
 
 @mcp.tool()
-async def list_all_sections() -> str:
+async def list_all_sections(use_api: bool = False) -> str:
     """List ALL sections across ALL notebooks.
 
     Useful for getting a complete overview of everything in your OneNote.
+
+    Args:
+        use_api: If True, use live API data instead of local backup files.
     """
+    source = _resolve_source(use_api)
+
+    if source == "api":
+        if not _check_api_availability():
+            return "API access requires authentication. Run 'authenticate' tool first."
+        # Use hierarchy directly — sections are already included, no extra API calls
+        hierarchy = graph_client._ensure_hierarchy()
+        nbs = hierarchy.get("notebooks", [])
+        if not nbs:
+            return "No notebooks found via Graph API."
+        lines = []
+        for nb in nbs:
+            lines.append(f"\n## {nb['displayName']}")
+            for sec in nb.get("sections", []):
+                lines.append(f"  - {sec.get('displayName', '?')}")
+        return "\n".join(lines)
+
     notebooks = _discover_notebooks()
     if not notebooks:
         return f"No notebooks found in {ONENOTE_DIRS}"
-
     lines = []
     for nb_name, nb_info in sorted(notebooks.items()):
         lines.append(f"\n## {nb_name}")
@@ -525,19 +643,33 @@ async def list_all_sections() -> str:
             latest = sec_info["latest"]
             size_kb = latest.stat().st_size / 1024
             lines.append(f"  - {sec_name}  ({size_kb:.0f} KB)")
-
     return "\n".join(lines)
 
 
 @mcp.tool()
-async def get_notebook_summary(notebook_name: str) -> str:
+async def get_notebook_summary(notebook_name: str, use_api: bool = False) -> str:
     """Get a summary of a notebook: its sections and a preview of each section's content.
 
     Args:
         notebook_name: The name of the notebook.
+        use_api: If True, use live API data instead of local backup files.
     """
-    notebooks = _discover_notebooks()
+    source = _resolve_source(use_api)
 
+    if source == "api":
+        if not _check_api_availability():
+            return "API access requires authentication. Run 'authenticate' tool first."
+        secs = graph_client.list_sections_graph(notebook_name)
+        if secs is None:
+            available = [nb["displayName"] for nb in graph_client.list_notebooks_graph()]
+            return f"Notebook '{notebook_name}' not found. Available: {', '.join(available)}"
+        lines = [f"# {notebook_name}\n"]
+        for sec in secs:
+            lines.append(f"## {sec['displayName']}")
+            lines.append("")
+        return "\n".join(lines)
+
+    notebooks = _discover_notebooks()
     nb = None
     for key, val in notebooks.items():
         if key.lower() == notebook_name.lower():
@@ -547,16 +679,12 @@ async def get_notebook_summary(notebook_name: str) -> str:
     if nb is None:
         available = ", ".join(sorted(notebooks.keys()))
         return f"Notebook '{notebook_name}' not found. Available: {available}"
-
     lines = [f"# {notebook_name}\n"]
-
     for sec_name, sec_info in sorted(nb["sections"].items()):
         filepath = sec_info["latest"]
         texts = _parse_one_file(filepath)
-
         lines.append(f"## {sec_name}")
         if texts:
-            # Show first ~200 chars as preview
             preview = " | ".join(texts)
             if len(preview) > 200:
                 preview = preview[:200] + "..."
@@ -564,7 +692,6 @@ async def get_notebook_summary(notebook_name: str) -> str:
         else:
             lines.append("  (no text content)")
         lines.append("")
-
     return "\n".join(lines)
 
 
@@ -872,102 +999,230 @@ def _com_list_pages(section_id: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# MCP Write Tools (Windows only -- requires OneNote COM API via PowerShell)
+# MCP Write & Page Listing Tools (Graph API on all platforms, COM on Windows)
 # ---------------------------------------------------------------------------
 
-if sys.platform == "win32":
 
-    @mcp.tool()
-    async def list_live_notebooks() -> str:
-        """List notebooks from the running OneNote app (live, not backup files).
+@mcp.tool()
+async def list_pages(notebook_name: str, section_name: str, use_api: bool = False) -> str:
+    """List pages in a section (with IDs for appending).
 
-        This uses the OneNote COM API and shows the notebooks currently open in
-        the OneNote desktop app, including their sections. Use this to find
-        where to create new pages.
-        """
-        root = _com_get_hierarchy(3)
-        if root is None:
-            return "Could not connect to OneNote. Make sure the OneNote desktop app is installed."
+    Args:
+        notebook_name: Name of the notebook.
+        section_name: Name of the section.
+        use_api: If True, use live API data instead of local backup files.
+    """
+    source = _resolve_source(use_api)
 
+    if source == "api":
+        if not _check_api_availability():
+            return "API access requires authentication. Run 'authenticate' tool first."
+        pages = graph_client.list_pages_graph(notebook_name, section_name)
+        if pages is None:
+            return f"Could not find section '{section_name}' in notebook '{notebook_name}'. Use list_notebooks(use_api=True) to browse."
+        if not pages:
+            return "No pages found in this section."
         lines = []
-        for nb in root.findall(f"{{{ONE_NS}}}Notebook"):
-            nb_name = nb.get("name", "?")
-            lines.append(f"\n## {nb_name}")
-            for sec in nb.iter(f"{{{ONE_NS}}}Section"):
-                if sec.get("isInRecycleBin") == "true":
-                    continue
-                sec_name = sec.get("name", "?")
-                locked = " (locked)" if sec.get("locked") == "true" else ""
-                lines.append(f"  - {sec_name}{locked}")
-
-        if not lines:
-            return "No notebooks found in OneNote."
+        for p in pages:
+            lines.append(f"- {p['title']}  (id: {p['id']})")
         return "\n".join(lines)
 
-    @mcp.tool()
-    async def create_page(notebook_name: str, section_name: str, title: str, content: str) -> str:
-        """Create a new page in a OneNote notebook section.
+    # Local source: list page titles from backup files
+    notebooks = _discover_notebooks()
+    nb = None
+    for key, val in notebooks.items():
+        if key.lower() == notebook_name.lower():
+            nb = val
+            break
+    if nb is None:
+        available = ", ".join(sorted(notebooks.keys()))
+        return f"Notebook '{notebook_name}' not found. Available: {available}"
+    sec_info = None
+    for key, val in nb["sections"].items():
+        if key.lower() == section_name.lower():
+            sec_info = val
+            break
+    if sec_info is None:
+        available = ", ".join(sorted(nb["sections"].keys()))
+        return f"Section '{section_name}' not found. Available: {available}"
+    filepath = sec_info["latest"]
+    pages = _parse_pages(filepath)
+    if not pages:
+        return "No pages found in this section."
+    lines = []
+    for p in pages:
+        lines.append(f"- {p['title']}")
+    return "\n".join(lines) + "\n\n(Note: page IDs for appending require use_api=True or Graph API authentication.)"
 
-        The content is written as HTML. You can use basic HTML tags like
-        <b>, <i>, <br>, <ul>, <li>, <h1>-<h6>, etc.
 
-        Requires the OneNote desktop app to be installed.
+@mcp.tool()
+async def create_page(notebook_name: str, section_name: str, title: str, content: str, use_com: bool = False) -> str:
+    """Create a new page in a OneNote notebook section.
 
-        Args:
-            notebook_name: Name of the notebook (from list_live_notebooks).
-            section_name: Name of the section within the notebook.
-            title: Title for the new page.
-            content: The page content (plain text or HTML).
-        """
+    Uses Graph API by default (works on all platforms). On Windows, set
+    use_com=True to use the COM API instead (requires OneNote desktop app).
+
+    Args:
+        notebook_name: Name of the notebook.
+        section_name: Name of the section within the notebook.
+        title: Title for the new page.
+        content: The page content (plain text or HTML).
+        use_com: (Windows only) If True, use COM API instead of Graph API.
+    """
+    if use_com and sys.platform == "win32":
         section_id = _com_find_section_id(notebook_name, section_name)
         if section_id is None:
             return (
                 f"Could not find section '{section_name}' in notebook '{notebook_name}'. "
-                f"Use list_live_notebooks to see available notebooks and sections."
+                f"Use list_notebooks() to see available notebooks and sections."
             )
-
         ok, msg = _com_create_page(section_id, title, content)
         return msg
 
-    @mcp.tool()
-    async def list_live_pages(notebook_name: str, section_name: str) -> str:
-        """List pages in a section from the running OneNote app.
+    # Graph API
+    if not _check_api_availability():
+        return "Write operations require authentication. Run 'authenticate' tool first."
+    ok, msg = graph_client.create_page_graph(notebook_name, section_name, title, content)
+    return msg
 
-        Use this to find page IDs for appending content to existing pages.
 
-        Args:
-            notebook_name: Name of the notebook.
-            section_name: Name of the section.
-        """
-        section_id = _com_find_section_id(notebook_name, section_name)
-        if section_id is None:
-            return (
-                f"Could not find section '{section_name}' in notebook '{notebook_name}'. "
-                f"Use list_live_notebooks to see available notebooks and sections."
-            )
+@mcp.tool()
+async def append_to_page(page_id: str, content: str, use_com: bool = False) -> str:
+    """Append content to an existing OneNote page.
 
-        pages = _com_list_pages(section_id)
-        if not pages:
-            return "No pages found in this section."
+    Uses Graph API by default (works on all platforms). On Windows, set
+    use_com=True to use the COM API instead (requires OneNote desktop app).
 
-        lines = []
-        for p in pages:
-            lines.append(f"- {p['name']}  (id: {p['id']})")
-        return "\n".join(lines)
-
-    @mcp.tool()
-    async def append_to_page(page_id: str, content: str) -> str:
-        """Append content to an existing OneNote page.
-
-        The content is added as a new outline block at the bottom of the page.
-        Supports HTML formatting (<b>, <i>, <br>, <ul>, <li>, etc.).
-
-        Args:
-            page_id: The page ID (from list_live_pages).
-            content: The content to append (plain text or HTML).
-        """
+    Args:
+        page_id: The page ID (from list_pages).
+        content: The content to append (plain text or HTML).
+        use_com: (Windows only) If True, use COM API instead of Graph API.
+    """
+    if use_com and sys.platform == "win32":
         ok, msg = _com_append_to_page(page_id, content)
         return msg
+
+    # Graph API
+    if not _check_api_availability():
+        return "Write operations require authentication. Run 'authenticate' tool first."
+    ok, msg = graph_client.append_to_page_graph(page_id, content)
+    return msg
+
+
+@mcp.tool()
+async def update_page_content(page_id: str, content: str) -> str:
+    """Replace the body content of an existing OneNote page.
+
+    The entire page body is replaced with the new content.
+    Use HTML for formatting (e.g. <b>, <i>, <h1>-<h6>, <p>, <ul>, <li>,
+    <span style="font-family:Arial;font-size:14pt">styled text</span>).
+
+    Args:
+        page_id: The page ID (from list_pages with use_api=True).
+        content: The new page content (plain text or HTML).
+    """
+    if not _check_api_availability():
+        return "Write operations require authentication. Run 'authenticate' tool first."
+    ok, msg = graph_client.update_page_content_graph(page_id, content)
+    return msg
+
+
+@mcp.tool()
+async def prepend_to_page(page_id: str, content: str) -> str:
+    """Add content to the top of an existing OneNote page.
+
+    Like append_to_page, but inserts at the beginning instead of the end.
+
+    Args:
+        page_id: The page ID (from list_pages with use_api=True).
+        content: The content to prepend (plain text or HTML).
+    """
+    if not _check_api_availability():
+        return "Write operations require authentication. Run 'authenticate' tool first."
+    ok, msg = graph_client.prepend_to_page_graph(page_id, content)
+    return msg
+
+
+@mcp.tool()
+async def replace_text_in_page(page_id: str, find_text: str, replace_text: str, case_sensitive: bool = False) -> str:
+    """Find and replace text in an existing OneNote page.
+
+    Useful for fixing typos or making small edits without rewriting the whole page.
+
+    Args:
+        page_id: The page ID (from list_pages with use_api=True).
+        find_text: The text to find.
+        replace_text: The text to replace it with.
+        case_sensitive: If True, match case exactly. Default is case-insensitive.
+    """
+    if not _check_api_availability():
+        return "Write operations require authentication. Run 'authenticate' tool first."
+    ok, msg = graph_client.replace_text_in_page_graph(page_id, find_text, replace_text, case_sensitive)
+    return msg
+
+
+# ---------------------------------------------------------------------------
+# Authentication & Configuration Tools
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def authenticate() -> str:
+    """Authenticate with Microsoft Graph API for live data and write access.
+
+    Returns a device code and URL immediately. Open the URL in a browser,
+    enter the code, and sign in with your Microsoft account.
+    Then run 'check_auth' to verify.
+
+    Required for: write operations (all platforms), and reading live data via use_api=True.
+    Not required for: reading from local backup files (the default).
+    """
+    try:
+        result = graph_auth.authenticate()
+        return result
+    except Exception as e:
+        return f"Authentication failed: {e}"
+
+
+@mcp.tool()
+async def check_auth() -> str:
+    """Check if authentication has completed after running 'authenticate'.
+
+    Call this after you've signed in via the browser to verify the token was acquired.
+    """
+    result = graph_auth.check_auth()
+    _check_api_availability()
+    return result
+
+
+@mcp.tool()
+async def set_data_source(source: str) -> str:
+    """Set the default data source for read operations.
+
+    Args:
+        source: Either 'local' (backup files, default) or 'api' (live via Graph API).
+    """
+    global _DEFAULT_SOURCE
+    if source not in ("local", "api"):
+        return "Error: source must be 'local' or 'api'."
+    if source == "api" and not _check_api_availability():
+        return "API source requires authentication. Run 'authenticate' tool first."
+    _DEFAULT_SOURCE = source
+    log.info("Default data source set to: %s", source)
+    return f"Default data source set to '{source}'. You can override per-request with the 'use_api' parameter."
+
+
+@mcp.tool()
+async def clear_auth() -> str:
+    """Clear cached authentication tokens (for re-authentication).
+
+    After clearing, you'll need to run 'authenticate' again to use API features.
+    """
+    result = graph_auth.clear_token()
+    global _API_AVAILABLE
+    _API_AVAILABLE = False
+    graph_client.invalidate_cache()
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -993,18 +1248,22 @@ def _ensure_search_index():
 
 
 def main():
-    if not ONENOTE_DIRS:
-        log.error(
-            "No OneNote backup directories found. Checked: %s\n"
-            "Set the ONENOTE_BACKUP_DIR environment variable to the correct path.",
+    if ONENOTE_DIRS:
+        log.info("Starting OneNote MCP server...")
+        log.info("Local backup dirs: %s", ONENOTE_DIRS)
+        _ensure_search_index()
+    else:
+        log.warning(
+            "No local OneNote backup directories found (checked: %s). "
+            "Local reads disabled. Use 'authenticate' tool for Graph API access.",
             DEFAULT_BACKUP_DIRS,
         )
-        sys.exit(1)
 
-    log.info("Starting OneNote MCP server (local files)...")
-    log.info("Reading from: %s", ONENOTE_DIRS)
-
-    _ensure_search_index()
+    _check_api_availability()
+    if _API_AVAILABLE:
+        log.info("Graph API: authenticated")
+    else:
+        log.info("Graph API: not authenticated (run 'authenticate' tool for write/live access)")
 
     mcp.run(transport="stdio")
 

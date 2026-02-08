@@ -6,9 +6,11 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "mcp[cli]>=1.26.0",
+    "msal>=1.30.0",
     "numpy",
     "pyobjc-framework-Quartz; sys_platform == 'darwin'",
     "pyobjc-framework-Vision; sys_platform == 'darwin'",
     "pyonenote @ git+https://github.com/delorfin/pyOneNote.git",
+    "requests>=2.31.0",
     "sentence-transformers",
 ]
