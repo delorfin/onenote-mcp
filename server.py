@@ -441,6 +441,8 @@ async def search_notes(query: str, exact_match: bool = False) -> str:
         exact_match: If True, use exact substring matching (case-insensitive).
                      If False (default), use semantic similarity search.
     """
+    if not exact_match:
+        _ensure_search_index()
     if not exact_match and _search_index is not None:
         matches = _search_index.search(query, top_k=20)
         if not matches:
@@ -498,12 +500,11 @@ async def rebuild_search_index() -> str:
     or if the index seems stale.
     """
     global _search_index
-    notebooks = _discover_notebooks()
-    if not notebooks:
+    _search_index = None
+    _ensure_search_index()
+    if _search_index is None:
         return "No notebooks found -- nothing to index."
-
-    _search_index = EmbeddingIndex()
-    count = _search_index.build(notebooks, _parse_pages)
+    count = len(_search_index._metadata)
     return f"Search index rebuilt: {count} pages indexed."
 
 
@@ -973,8 +974,8 @@ if sys.platform == "win32":
 # Entry point
 # ---------------------------------------------------------------------------
 
-def _build_search_index():
-    """Build or update the semantic search index."""
+def _ensure_search_index():
+    """Build the semantic search index if needed, or incrementally update it."""
     global _search_index
     notebooks = _discover_notebooks()
     if not notebooks:
@@ -982,7 +983,8 @@ def _build_search_index():
         return
 
     try:
-        _search_index = EmbeddingIndex()
+        if _search_index is None:
+            _search_index = EmbeddingIndex()
         count = _search_index.build(notebooks, _parse_pages)
         log.info("Search index ready: %d pages indexed", count)
     except Exception as e:
@@ -1002,7 +1004,7 @@ def main():
     log.info("Starting OneNote MCP server (local files)...")
     log.info("Reading from: %s", ONENOTE_DIRS)
 
-    _build_search_index()
+    _ensure_search_index()
 
     mcp.run(transport="stdio")
 

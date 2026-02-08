@@ -146,7 +146,7 @@ Once connected, you can ask Claude:
 2. Organizes them by notebook and section (grouping backup versions together)
 3. Uses [pyOneNote](https://github.com/delorfin/pyOneNote) to parse the binary `.one` format
 4. Extracts page titles and text content, plus OCR text from embedded images (macOS)
-5. Builds a semantic search index at startup (cached incrementally to disk)
+5. Builds a semantic search index at startup and incrementally updates it before each search (cached to disk)
 
 **Writing (Windows):**
 1. Connects to the running OneNote desktop app via the COM API
